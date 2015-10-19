@@ -187,16 +187,46 @@ namespace zmq {
    * Helpers for dealing with ØMQ errors.
    */
 
-  static inline const char*
-  ErrorMessage() {
-    return zmq_strerror(zmq_errno());
+ static inline const char*
+  ErrorMessage(int line) {
+    static char s[1024];
+    sprintf(s, "%d: %s(%d:%d)", line, zmq_strerror(zmq_errno()), zmq_errno(), EINTR);
+    return s;
+    //return zmq_strerror(zmq_errno());
   }
 
   static inline Local<Value>
-  ExceptionFromError() {
-    return Nan::Error(ErrorMessage());
+  ExceptionFromError(int line) {
+    return Nan::Error(ErrorMessage(line));
   }
 
+  /*
+   * Helpers for dealing with ØMQ EINT error return.
+   */
+  static inline int
+  eintr_zmq_poll (zmq_pollitem_t *items, int nitems, long timeout) {
+    int rc = 0;
+    while (true) {
+      rc = zmq_poll(items, nitems, timeout);
+      if (rc < 0 && zmq_errno()==EINTR) {
+          continue;
+      }
+      break;
+    }
+    return rc;
+  }
+
+  static inline int eintr_zmq_getsockopt (void *socket, int option_name, void *option_value, size_t *option_len) {
+    int rc = 0;
+    while (true) {
+      rc = zmq_getsockopt (socket, option_name, option_value, option_len);
+      if (rc < 0 && zmq_errno()==EINTR) {
+          continue;
+      }
+      break;
+    }
+    return rc;
+  }
 
   /*
    * Context methods.
@@ -240,7 +270,7 @@ namespace zmq {
 
   Context::Context(int io_threads) : Nan::ObjectWrap() {
     context_ = zmq_init(io_threads);
-    if (!context_) throw std::runtime_error(ErrorMessage());
+    if (!context_) throw std::runtime_error(ErrorMessage(__LINE__));
   }
 
   Context *
@@ -251,7 +281,7 @@ namespace zmq {
   void
   Context::Close() {
     if (context_ != NULL) {
-      if (zmq_term(context_) < 0) throw std::runtime_error(ErrorMessage());
+      if (zmq_term(context_) < 0) throw std::runtime_error(ErrorMessage(__LINE__));
       context_ = NULL;
     }
   }
@@ -272,7 +302,7 @@ namespace zmq {
 
     Context *context = GetContext(info);
     if (zmq_ctx_set(context->context_, option, value) < 0)
-      return Nan::ThrowError(ExceptionFromError());
+      return Nan::ThrowError(ExceptionFromError(__LINE__));
     return;
   }
 
@@ -360,16 +390,9 @@ namespace zmq {
     zmq_pollitem_t item = {socket_, 0, ZMQ_POLLIN, 0};
     if (pending_ > 0)
       item.events |= ZMQ_POLLOUT;
-    while (true) {
-      int rc = zmq_poll(&item, 1, 0);
-      if (rc < 0) {
-        if (zmq_errno()==EINTR) {
-          continue;
-        }
-        throw std::runtime_error(ErrorMessage());
-      } else {
-        break;
-      }
+
+    if (eintr_zmq_poll(&item, 1, 0) < 0) {
+        throw std::runtime_error(ErrorMessage(__LINE__));
     }
     return item.revents & item.events;
   }
@@ -443,7 +466,7 @@ namespace zmq {
 
     const char* error = NULL;
     int64_t ittr = 0;
-    while ((s->num_of_events_ == 0 || s->num_of_events_ > ittr++) && zmq_poll(&item, 1, 0)) {
+    while ((s->num_of_events_ == 0 || s->num_of_events_ > ittr++) && eintr_zmq_poll(&item, 1, 0)) {
       zmq_msg_init (&msg1);
       if (zmq_recvmsg (s->monitor_socket_, &msg1, ZMQ_DONTWAIT) > 0) {
         char event_endpoint[1025];
@@ -460,7 +483,7 @@ namespace zmq {
         // get our next frame it may have the target address and safely copy to our buffer
         zmq_msg_init (&msg2);
         if (zmq_msg_more(&msg1) == 0 || zmq_recvmsg (s->monitor_socket_, &msg2, 0) == -1) {
-          error = ErrorMessage();
+          error = ErrorMessage(__LINE__);
           zmq_msg_close(&msg2);
           break;
         }
@@ -489,7 +512,7 @@ namespace zmq {
         zmq_msg_close(&msg1);
       }
       else {
-        error = ErrorMessage();
+        error = ErrorMessage(__LINE__);
         zmq_msg_close(&msg1);
         break;
       }
@@ -514,7 +537,7 @@ namespace zmq {
     state_ = STATE_READY;
 
     if (NULL == socket_) {
-      Nan::ThrowError(ErrorMessage());
+      Nan::ThrowError(ErrorMessage(__LINE__));
       return;
     }
 
@@ -527,8 +550,8 @@ namespace zmq {
     uv_os_sock_t socket;
     size_t len = sizeof(uv_os_sock_t);
 
-    if (zmq_getsockopt(socket_, ZMQ_FD, &socket, &len)) {
-      throw std::runtime_error(ErrorMessage());
+    if (eintr_zmq_getsockopt(socket_, ZMQ_FD, &socket, &len)) {
+      throw std::runtime_error(ErrorMessage(__LINE__));
     }
 
     #if ZMQ_CAN_MONITOR
@@ -578,17 +601,9 @@ namespace zmq {
   Local<Value> Socket::GetSockOpt(int option) {
     T value = 0;
     size_t len = sizeof(T);
-    while (true) {
-      int rc = zmq_getsockopt(socket_, option, &value, &len);
-      if (rc < 0) {
-        if(zmq_errno()==EINTR) {
-          continue;
-        }
-        Nan::ThrowError(ExceptionFromError());
+    if (eintr_zmq_getsockopt(socket_, option, &value, &len) <0) {
+        Nan::ThrowError(ExceptionFromError(__LINE__));
         return Nan::Undefined();
-      } else {
-        break;
-      }
     }
     return Nan::New<Number>(value);
   }
@@ -601,7 +616,7 @@ namespace zmq {
     }
     T value = Nan::To<T>(wrappedValue).FromJust();
     if (zmq_setsockopt(socket_, option, &value, sizeof(T)) < 0)
-      Nan::ThrowError(ExceptionFromError());
+      Nan::ThrowError(ExceptionFromError(__LINE__));
     return Nan::Undefined();
   }
 
@@ -609,8 +624,8 @@ namespace zmq {
   Socket::GetSockOpt<char*>(int option) {
     char value[1024];
     size_t len = sizeof(value) - 1;
-    if (zmq_getsockopt(socket_, option, value, &len) < 0) {
-      Nan::ThrowError(ExceptionFromError());
+    if (eintr_zmq_getsockopt(socket_, option, value, &len) < 0) {
+      Nan::ThrowError(ExceptionFromError(__LINE__));
       return Nan::Undefined();
     }
     value[len] = '\0';
@@ -626,7 +641,7 @@ namespace zmq {
     Local<Object> buf = wrappedValue.As<Object>();
     size_t length = Buffer::Length(buf);
     if (zmq_setsockopt(socket_, option, Buffer::Data(buf), length) < 0)
-      Nan::ThrowError(ExceptionFromError());
+      Nan::ThrowError(ExceptionFromError(__LINE__));
     return Nan::Undefined();
   }
 
@@ -760,7 +775,7 @@ namespace zmq {
     GET_SOCKET(info);
     socket->state_ = STATE_BUSY;
     if (zmq_bind(socket->socket_, *addr) < 0)
-      return Nan::ThrowError(ErrorMessage());
+      return Nan::ThrowError(ErrorMessage(__LINE__));
 
     socket->state_ = STATE_READY;
 
@@ -833,7 +848,7 @@ namespace zmq {
     GET_SOCKET(info);
     socket->state_ = STATE_BUSY;
     if (zmq_unbind(socket->socket_, *addr) < 0)
-      return Nan::ThrowError(ErrorMessage());
+      return Nan::ThrowError(ErrorMessage(__LINE__));
 
     socket->state_ = STATE_READY;
 
@@ -852,8 +867,17 @@ namespace zmq {
     GET_SOCKET(info);
 
     Nan::Utf8String address(info[0].As<String>());
-    if (zmq_connect(socket->socket_, *address))
-      return Nan::ThrowError(ErrorMessage());
+    while(true) {
+      int rc;
+      rc=zmq_connect(socket->socket_, *address);
+      if ( rc < 0 && zmq_errno()==EINTR) {
+        continue;
+      } else if (rc<0) {
+        return Nan::ThrowError(ErrorMessage(__LINE__));
+      } else {
+        break;
+      }
+    }
 
     if (socket->endpoints++ == 0)
       socket->Ref();
@@ -872,7 +896,7 @@ namespace zmq {
 
     Nan::Utf8String address(info[0].As<String>());
     if (zmq_disconnect(socket->socket_, *address))
-      return Nan::ThrowError(ErrorMessage());
+      return Nan::ThrowError(ErrorMessage(__LINE__));
     if (--socket->endpoints == 0)
       socket->Unref();
 
@@ -926,12 +950,12 @@ namespace zmq {
         public:
           inline MessageReference() {
             if (zmq_msg_init(&msg_) < 0)
-              throw std::runtime_error(ErrorMessage());
+              throw std::runtime_error(ErrorMessage(__LINE__));
           }
 
           inline ~MessageReference() {
             if (zmq_msg_close(&msg_) < 0)
-              throw std::runtime_error(ErrorMessage());
+              throw std::runtime_error(ErrorMessage(__LINE__));
           }
 
           inline operator zmq_msg_t*() {
@@ -999,7 +1023,7 @@ namespace zmq {
 
     // Close the monitor socket and stop timer
     if (zmq_close(this->monitor_socket_) < 0)
-      throw std::runtime_error(ErrorMessage());
+      throw std::runtime_error(ErrorMessage(__LINE__));
     uv_timer_stop(this->monitor_handle_);
     this->monitor_handle_ = NULL;
     this->monitor_socket_ = NULL;
@@ -1040,7 +1064,7 @@ namespace zmq {
         if (zmq_errno()==EINTR) {
           continue;
         }
-        return Nan::ThrowError(ErrorMessage());
+        return Nan::ThrowError(ErrorMessage(__LINE__));
       } else {
         break;
       }
@@ -1061,13 +1085,13 @@ namespace zmq {
         if (zmq_msg_init_data(&msg_, Buffer::Data(buf), Buffer::Length(buf),
             BufferReference::FreeCallback, bufref_) < 0) {
           delete bufref_;
-          throw std::runtime_error(ErrorMessage());
+          throw std::runtime_error(ErrorMessage(__LINE__));
         }
       };
 
       inline ~OutgoingMessage() {
         if (zmq_msg_close(&msg_) < 0)
-          throw std::runtime_error(ErrorMessage());
+          throw std::runtime_error(ErrorMessage(__LINE__));
       };
 
       inline operator zmq_msg_t*() {
@@ -1130,14 +1154,14 @@ namespace zmq {
 #if 0  // zero-copy version, but doesn't properly pin buffer and so has GC issues
     OutgoingMessage msg(info[0].As<Object>());
     if (zmq_send(socket->socket_, msg, flags) < 0)
-        return Nan::ThrowError(ErrorMessage());
+        return Nan::ThrowError(ErrorMessage(__LINE__));
 #else // copying version that has no GC issues
     zmq_msg_t msg;
     Local<Object> buf = info[0].As<Object>();
     size_t len = Buffer::Length(buf);
     int res = zmq_msg_init_size(&msg, len);
     if (res != 0)
-      return Nan::ThrowError(ErrorMessage());
+      return Nan::ThrowError(ErrorMessage(__LINE__));
 
     char * cp = static_cast<char *>(zmq_msg_data(&msg));
     const char * dat = Buffer::Data(buf);
@@ -1155,7 +1179,7 @@ namespace zmq {
         if (zmq_errno()==EINTR) {
           continue;
         }
-        return Nan::ThrowError(ErrorMessage());
+        return Nan::ThrowError(ErrorMessage(__LINE__));
       } else {
         break;
       }
@@ -1176,7 +1200,7 @@ namespace zmq {
   Socket::Close() {
     if (socket_) {
       if (zmq_close(socket_) < 0)
-        throw std::runtime_error(ErrorMessage());
+        throw std::runtime_error(ErrorMessage(__LINE__));
       socket_ = NULL;
       state_ = STATE_CLOSED;
       context_.Reset();
